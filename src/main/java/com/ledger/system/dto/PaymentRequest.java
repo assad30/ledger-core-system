@@ -10,10 +10,8 @@ public record PaymentRequest(
 
         @NotNull Long userAccountId,
         @NotNull Long merchantAccountId,
-
         @NotNull BigDecimal amount,
         @PositiveOrZero BigDecimal fee,
-
         @NotBlank String idempotencyKey
 
 ) { }

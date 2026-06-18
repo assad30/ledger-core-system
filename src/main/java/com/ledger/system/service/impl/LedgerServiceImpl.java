@@ -1,25 +1,20 @@
 package com.ledger.system.service.impl;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ledger.system.dto.PaymentRequest;
 import com.ledger.system.dto.TransactionResponse;
-import com.ledger.system.entity.Account;
-import com.ledger.system.entity.IdempotencyKey;
-import com.ledger.system.entity.LedgerEntry;
-import com.ledger.system.entity.LedgerTransaction;
+import com.ledger.system.entity.*;
 import com.ledger.system.enums.EntryType;
-import com.ledger.system.enums.ErrorCode;
 import com.ledger.system.enums.TransactionType;
-import com.ledger.system.exception.BusinessException;
-import com.ledger.system.repository.AccountRepository;
-import com.ledger.system.repository.IdempotencyRepository;
-import com.ledger.system.repository.LedgerEntryRepository;
-import com.ledger.system.repository.LedgerTransactionRepository;
+import com.ledger.system.repository.*;
 import com.ledger.system.service.LedgerService;
+import com.ledger.system.validation.LedgerValidationService;
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Service
@@ -30,6 +25,8 @@ public class LedgerServiceImpl implements LedgerService {
     private final LedgerTransactionRepository transactionRepository;
     private final LedgerEntryRepository entryRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final ObjectMapper objectMapper;
+    private final LedgerValidationService validationService;
 
     private static final Long FEES_ACCOUNT_ID = 3L;
 
@@ -37,25 +34,45 @@ public class LedgerServiceImpl implements LedgerService {
     @Transactional
     public TransactionResponse processPayment(PaymentRequest request) {
 
-        if (idempotencyRepository.existsByKeyValue(request.idempotencyKey())) {
-            throw new BusinessException("Duplicate Payment Request", ErrorCode.DUPLICATE_TRANSACTION);
-        }
-        validateAmount(request.amount(),request.fee(),request.userAccountId(),request.merchantAccountId());
 
-        // 2. LOCK ACCOUNTS (CONCURRENCY SAFETY)
+        var existingOpt = idempotencyRepository.findByKeyValue(request.idempotencyKey());
+
+        if (existingOpt.isPresent()) {
+            IdempotencyKey existing = existingOpt.get();
+            if ("SUCCESS".equals(existing.getStatus())) {
+                try {
+                    return objectMapper.readValue(existing.getResponse(),TransactionResponse.class);
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to parse cached response", e);
+                }
+            }
+
+            throw new RuntimeException("Request already processing");
+        }
+
+        IdempotencyKey pending = new IdempotencyKey();
+        pending.setKeyValue(request.idempotencyKey());
+        pending.setStatus("PENDING");
+        pending.setCreatedAt(LocalDateTime.now());
+        idempotencyRepository.save(pending);
+
+
+        validationService.validatePayment(request.amount(), request.fee(), request.userAccountId(),request.merchantAccountId());
+
+
         Account user = accountRepository.lockAccount(request.userAccountId());
         Account merchant = accountRepository.lockAccount(request.merchantAccountId());
 
-        // 3. CALCULATE AMOUNTS
         BigDecimal total = request.amount();
         BigDecimal fee = request.fee();
         BigDecimal merchantAmount = total.subtract(fee);
 
-        // 4. CREATE TRANSACTION HEADER
+
         LedgerTransaction tx = new LedgerTransaction();
         tx.setTransactionReference(UUID.randomUUID());
         tx.setTransactionType(TransactionType.PAYMENT);
         tx.setIdempotencyKey(request.idempotencyKey());
+
         tx = transactionRepository.save(tx);
 
         Long txId = tx.getId();
@@ -66,17 +83,33 @@ public class LedgerServiceImpl implements LedgerService {
 
         validateBalanced(txId);
 
-        IdempotencyKey key = new IdempotencyKey();
-        key.setKeyValue(request.idempotencyKey());
-        idempotencyRepository.save(key);
 
-        return new TransactionResponse(tx.getTransactionReference(), "SUCCESS");
+        TransactionResponse response = new TransactionResponse(tx.getTransactionReference(), "SUCCESS");
 
+        // =========================
+        // 8. UPDATE IDEMPOTENCY
+        // =========================
+        IdempotencyKey record = idempotencyRepository.findByKeyValue(request.idempotencyKey())
+                        .orElseThrow();
+
+        record.setStatus("SUCCESS");
+        record.setTransactionReference(tx.getTransactionReference());
+
+        try {
+            record.setResponse(objectMapper.writeValueAsString(response));
+        } catch (Exception e) {
+            throw new RuntimeException("Serialization failed", e);
+        }
+        idempotencyRepository.save(record);
+
+        return response;
     }
 
-    private void createEntry(Long txId, Long accountId,
-                             EntryType type, BigDecimal amount) {
+    // =========================
+    // Helpers
+    // =========================
 
+    private void createEntry(Long txId, Long accountId, EntryType type, BigDecimal amount) {
         LedgerEntry entry = new LedgerEntry();
         entry.setTransactionId(txId);
         entry.setAccountId(accountId);
@@ -86,7 +119,6 @@ public class LedgerServiceImpl implements LedgerService {
     }
 
     private void validateBalanced(Long txId) {
-
         var entries = entryRepository.findByTransactionId(txId);
 
         BigDecimal debit = entries.stream()
@@ -101,40 +133,6 @@ public class LedgerServiceImpl implements LedgerService {
 
         if (debit.compareTo(credit) != 0) {
             throw new RuntimeException("Ledger not balanced!");
-        }
-    }
-
-    private void validateAmount(
-            BigDecimal amount,
-            BigDecimal fee,
-            Long userAccountId,
-            Long merchantAccountId) {
-
-        validateAmount(amount);
-        validateFee(amount, fee);
-        validateAccounts(userAccountId, merchantAccountId);
-    }
-
-    private void validateAmount(BigDecimal amount){
-        if(amount==null || amount.compareTo(BigDecimal.ZERO)<=0){
-            throw new BusinessException("Amount must be greater than zero",
-                    ErrorCode.INVALID_AMOUNT);
-        }
-    }
-
-    private void validateFee(BigDecimal amount,BigDecimal fee){
-
-        if (fee == null || amount.compareTo(fee) <= 0) {
-            throw new BusinessException("Amount must be greater than Fee",
-                    ErrorCode.INVALID_FEE);
-        }
-    }
-
-    private void validateAccounts(Long userAccountId,Long merchantAccountId){
-
-        if (userAccountId == null || merchantAccountId == null || userAccountId.equals(merchantAccountId)) {
-            throw new BusinessException("User Account can not be as merchant Account",
-                    ErrorCode.ACCOUNT_INVALID);
         }
     }
 }
